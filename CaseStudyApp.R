@@ -4,6 +4,7 @@ library(ggplot2)
 library(forcats)
 library(vroom)
 library(shiny)
+library(bslib)
 
 # Load data in using vroom
 if (!exists("injuries")) {
@@ -13,98 +14,125 @@ if (!exists("injuries")) {
 }
 
 # Set up US
-ui <- fluidPage(
-  # Define first row
-  fluidRow(
-    # Set column width = 3 and select products from list of codes
-    column(3,
-           selectInput("code", "Product",
-                       choices = setNames(products$prod_code, products$title),
-                       width = "100%"
-           )
-    ),
-    # Set second column in first row as either rate or count
-    column(2, selectInput("y", "Y-axis Metric", c("rate", "count")))
-  ),
-  
-  # Define second row
-  fluidRow(
-    # First column in second row is for diagnosis table
-    column(4, tableOutput("diag")),
-    # Second column in second row is for body part table
-    column(4, tableOutput("body_part")),
-    # Third column in second row is for location table
-    column(4, tableOutput("location"))
-  ),
-  
-  # Define third row
-  fluidRow(
-    # One column for age_sex plot
-    column(12, plotOutput("age_sex"))
-  ),
-  # Define fourth row with narrative UI
-  fluidRow(
-    # First column action button
-    column(2, actionButton("story", "Tell me a story")),
-    # Second column is text output of narrative
-    column(10, textOutput("narrative"))
-  )
-)
+ui <- page_fillable(
+  # Application Title
+ title = "Emergency Room Case Study Application II",
+ # Top card with plot
+ card(
+   card_header("Number of Injuries by Sex & Age", class = "bg-dark"),
+   plotOutput("age_sex")
+   ),
+ # Second row of cards
+ layout_columns(
+     card(
+       card_header("Parameters", class = "bg-primary"),
+       selectInput("code", "Product of Interest",
+                   choices = setNames(products$prod_code, products$title), width = "100%"),
+       selectInput("y", "Y-axis Metric", c("rate", "count")),
+       sliderInput("nrow", "Number of Rows to Display", min = 3, max = 10, value = 5)
+       ),
+     card(
+       card_header("Diagnoses", class = "bg-dark"),
+       tableOutput("diag")
+       ),
+     card(
+       card_header("Body Part", class = "bg-dark"),
+       tableOutput("body_part")
+       ),
+     card(
+       card_header("Location", class = "bg-dark"),
+       tableOutput("location")
+       )
+     ),
+ # Third row of cards
+ layout_columns(
+   card(
+     card_header("Example Injury Report:", class = "bg-dark"),
+     textOutput("narrative")
+     ),
+   card(
+     actionButton("backone", "Back", class = "bg-primary")
+     ),
+   card(
+     actionButton("nextone", "Next", class = "bg-primary")
+     )
+   )
+ )
 
-# Define function to count only the top 5 of each variable and sum the rest into one
-count_top <- function(df, var, n = 5) {
-  df %>%
-    mutate({{ var }} := fct_lump(fct_infreq({{ var }}), n = n)) %>%
-    group_by({{ var }}) %>%
-    summarise(n = as.integer(sum(weight)))
-}
-
-# Define Server function 
-server <- function(input, output, session) {
-  # Define reactive variable for injuries to filter based on input from user
-  selected <- reactive(injuries %>% filter(prod_code == input$code))
+  # Define function to count only the top n of each variable and sum the rest into one based on user input
+  count_top <- function(df, var, n) {
+    df %>%
+      mutate({{ var }} := fct_lump(fct_infreq({{ var }}), n)) %>%
+      group_by({{ var }}) %>%
+      summarise(n = as.integer(sum(weight)))
+  }
   
-  # Call output tables
-  output$diag <- renderTable(count_top(selected(), diag), width = "100%")
-  output$body_part <- renderTable(count_top(selected(), body_part), width = "100%")
-  output$location <- renderTable(count_top(selected(), location), width = "100%")
+  # Define Server function 
+  server <- function(input, output, session) {
+    # Define reactive variable for injuries to filter based on input from user
+    selected <- reactive(injuries %>% filter(prod_code == input$code))
+    
+    #Create reactive variable for number of rows
+    numrow <- reactive({input$nrow})
+    
+    # Call output tables
+    output$diag <- renderTable(count_top(selected(), diag, numrow()), width = "100%")
+    output$body_part <- renderTable(count_top(selected(), body_part, numrow()), width = "100%")
+    output$location <- renderTable(count_top(selected(), location, numrow()), width = "100%")
+    
+    # Define reactive summary object to join selected injury data with population data 
+    # & calculate rate
+    summary <- reactive({
+      selected() %>%
+        count(age, sex, wt = weight) %>%
+        left_join(population, by = c("age", "sex")) %>%
+        mutate(rate = n / population * 1e4)
+    })
+    
+    # Call plot (either count or rate based on input$y)
+    output$age_sex <- renderPlot({
+      if (input$y == "count") {
+        summary() %>%
+          ggplot(aes(age, n, colour = sex)) +
+          geom_line() +
+          labs(y = "Estimated number of injuries") + 
+          theme_bw() + 
+          theme(panel.grid = element_blank(),
+                legend.position = c(0.9, 0.75)) + 
+          scale_x_continuous(limits = c(0, 80))
+      } else {
+        summary() %>%
+          ggplot(aes(age, rate, colour = sex)) +
+          geom_line(na.rm = TRUE) +
+          labs(y = "Injuries per 10,000 people") + 
+          theme_bw() + 
+          theme(panel.grid = element_blank(),
+                legend.position = c(0.9, 0.75)) + 
+          scale_x_continuous(limits = c(0, 80))
+      }
+    }, res = 96)
+    
+    # Define reactive narrative server to pull narratives from injuries and print them in order
+    # Going back and forth as user pleases
+    place <- reactive({input$nextone - input$backone})
+    injleng <- reactive({length(selected())})
+   
+    narrative_sample <- eventReactive(list(selected(), place()), {
+      data <- selected()
+      index <- place()
+      
+      if (index == 0) {
+        data$narrative[injleng()]
+      } else if (index < 0) {
+        data$narrative[injleng() + index]
+      } else {
+        data$narrative[index]
+      }
+    })
+    
+    # Call text output of narrative
+    output$narrative <- renderText(narrative_sample())
+  }
   
-  # Define reactive summary object to join selected injury data with population data 
-  # & calculate rate
-  summary <- reactive({
-    selected() %>%
-      count(age, sex, wt = weight) %>%
-      left_join(population, by = c("age", "sex")) %>%
-      mutate(rate = n / population * 1e4)
-  })
-  
-  # Call plot (either count or rate based on input$y)
-  output$age_sex <- renderPlot({
-    if (input$y == "count") {
-      summary() %>%
-        ggplot(aes(age, n, colour = sex)) +
-        geom_line() +
-        labs(y = "Estimated number of injuries") + 
-        theme_bw()
-    } else {
-      summary() %>%
-        ggplot(aes(age, rate, colour = sex)) +
-        geom_line(na.rm = TRUE) +
-        labs(y = "Injuries per 10,000 people") + 
-        theme_bw()
-    }
-  }, res = 96)
-  
-  # Define reactive narrative server to pull narratives from injuries and sample 1
-  # every time the story button is clicked or the selected data changes
-  narrative_sample <- eventReactive(
-    list(input$story, selected()),
-    selected() %>% pull(narrative) %>% sample(1)
-  )
-  
-  # Call text output of narrative
-  output$narrative <- renderText(narrative_sample())
-}
-
-# Run app
-shinyApp(ui, server)
+  # Run app
+  shinyApp(ui, server)
